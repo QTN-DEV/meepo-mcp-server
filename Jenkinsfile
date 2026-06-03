@@ -306,8 +306,24 @@ CMD ["src/index.js"]
             ).trim()
 
             echo "Applying ConfigMap / Secret / Deployment (classified at IDP Generate Jenkinsfile)"
-              echo "No ConfigMap variables — skipping"
-              echo "No Secret variables — skipping"
+              try {
+                def cmCred = "configmap-${env.K8S_CRED_PREFIX}-${env.BUILD_TYPE}"
+                echo "Applying ConfigMap from Jenkins credential: ${cmCred}"
+                withCredentials([file(credentialsId: cmCred, variable: 'K8S_CM_MANIFEST')]) {
+                  sh 'kubectl apply -f "$K8S_CM_MANIFEST" --kubeconfig="$KUBECONFIG"'
+                }
+              } catch (Exception e) {
+                echo "⚠️  ConfigMap apply skipped (credential missing or invalid): ${e.getMessage()}"
+              }
+              try {
+                def secCred = "secret-${env.K8S_CRED_PREFIX}-${env.BUILD_TYPE}"
+                echo "Applying Secret from Jenkins credential: ${secCred}"
+                withCredentials([file(credentialsId: secCred, variable: 'K8S_SECRET_MANIFEST')]) {
+                  sh 'kubectl apply -f "$K8S_SECRET_MANIFEST" --kubeconfig="$KUBECONFIG"'
+                }
+              } catch (Exception e) {
+                echo "⚠️  Secret apply skipped (credential missing or invalid): ${e.getMessage()}"
+              }
               sh '''
                 kubectl apply -f - --kubeconfig=$KUBECONFIG <<YAML
 apiVersion: apps/v1
@@ -337,7 +353,11 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
-
+        envFrom:
+          - configMapRef:
+              name: meepo-mcp-server-config
+          - secretRef:
+              name: meepo-mcp-server-secret
         resources:
           requests:
             cpu: "100m"
@@ -376,7 +396,9 @@ YAML
               '''
             }
 
-
+            sh '''
+              kubectl rollout restart deployment/${IMAGE_NAME} -n ${NAME_SPACE} --kubeconfig=$KUBECONFIG
+            '''
 
             sh '''
               kubectl rollout status deployment/${IMAGE_NAME} -n ${NAME_SPACE} \
