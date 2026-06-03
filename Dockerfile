@@ -1,19 +1,14 @@
-FROM node:20-alpine AS builder
-
+# ── Prod-deps stage ──────────────────────────────────────────
+FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install
-COPY tsconfig.json ./
-COPY src ./src
-RUN npx tsc
+COPY package*.json ./
+RUN npm ci --prod
 
-FROM node:20-alpine
+# ── Runtime stage (distroless) ────────────────────────────────
+FROM gcr.io/distroless/nodejs20-debian12 AS runner
 WORKDIR /app
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY package.json ./
-
 ENV NODE_ENV=production
-
-# stdio transport by default — override with TRANSPORT=http for remote
-CMD ["node", "dist/index.js"]
+COPY --from=deps /app/node_modules ./node_modules
+COPY src ./src
+EXPOSE 3000
+CMD ["src/index.js"]
