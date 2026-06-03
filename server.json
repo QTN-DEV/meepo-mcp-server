@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "app.meepo/studio",
+  "title": "Meepo Studio",
+  "description": "AI design platform with 24 MCP tools. Create social media posts, carousels, brand assets, videos, and full marketing campaigns from Claude, ChatGPT, Cursor, or any MCP-compatible agent. Free tier available.",
+  "repository": {
+    "url": "https://github.com/niceprompt/meepo-mcp-server",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://meepo-mcp-server.meepo.app/mcp"
+    },
+    {
+      "type": "sse",
+      "url": "https://meepo-mcp-server.meepo.app/sse"
+    }
+  ]
+}
