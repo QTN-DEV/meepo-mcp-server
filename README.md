@@ -1,4 +1,4 @@
-# Meepo Studio MCP Server
+# Meepo Studio MCP Server 
 
 [![smithery badge](https://smithery.ai/badge/lastblezebub/meepo)](https://smithery.ai/servers/lastblezebub/meepo)
 
