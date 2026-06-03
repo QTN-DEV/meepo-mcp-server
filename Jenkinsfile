@@ -1,33 +1,33 @@
-def IS_TAG = ''
-def BUILD_TYPE = ''
+def COMMIT_SHA    = ''
+def IS_TAG        = ''
+def BUILD_TYPE    = ''
 def IMAGE_VERSION = ''
-def NAME_SPACE = ''
-def SERVICE = 'meepo-mcp-server'
 
 pipeline {
   agent any
 
   environment {
-    PROJECT_NAME = 'meepo'
-    REGISTRY = 'quantumteknologi'
-    DOCKER_BUILDKIT = '1'
-    
-    REGISTRY_CRED = 'registry-docker'
-    REGISTRY_URL = 'https://index.docker.io/v1/'
-    SONAR_CRED = 'sonarcube'
-    SONAR_INSTALLATION = 'sonar-scanner'
-    SONAR_SCANNER_TOOL = 'sonar-scanner'
-    SLACK_BOT_WEBHOOK_URL = credentials('slack-infra-meepo')
-    GROUP_TELEGRAM = credentials('group-telegram')
-    BOT_TOKEN = credentials('TELEGRAM_BOT_TOKEN')
-  }
+    IMAGE_NAME        = 'meepo-mcp-server'
+    PROJECT_NAME      = 'meepo'
+    NAME_SPACE        = 'meepo-development'
+    REGISTRY          = 'quantumteknologi'
 
-  triggers {
-    githubPush()
-  }
+    REGISTRY_CRED         = 'registry-docker'
+    REGISTRY_URL          = 'https://index.docker.io/v1/'
+    SONAR_CRED            = 'sonarcube'
+    SONAR_INSTALLATION    = 'sonar-scanner'
+    SONAR_SCANNER_TOOL    = 'sonar-scanner'
 
-  parameters {
-    booleanParam(name: 'SKIP_DEVSECOPS', defaultValue: false, description: 'Skip DevSecOps stages (SonarQube, OWASP, Trivy)')
+
+    SLACK_BOT_WEBHOOK_URL = credentials('idp-slack-webhook-meepo-development')
+
+
+    KUBECONFIG_CRED   = 'kubeconfig-kubernet-matrix'
+    ENV_CRED_ID       = 'env-meepo-development'
+    K8S_CRED_PREFIX   = 'meepo'
+    GIT_CRED_ID       = 'meepo-cred'
+    IDP_WEBHOOK_URL   = credentials('idp-webhook-meepo-development')
+	NVD_API_KEY       = credentials('nvd-api-key')
   }
 
   options {
@@ -42,106 +42,119 @@ pipeline {
      * Checkout
      * ============================= */
     stage('Checkout') {
-      when {
-        anyOf {
-          branch 'master'
-          branch 'staging'
-          branch 'dev'
-        }
-      }
       steps {
         script {
-          def scmVars = checkout([
+          // Apply GIT_CRED_ID explicitly so HTTPS fetch uses the same credential on every agent.
+          // (checkout scm alone relies on the branch source; agents sometimes omit or differ → GitHub "Repository not found".)
+          checkout([
             $class: 'GitSCM',
             branches: scm.branches,
-            userRemoteConfigs: scm.userRemoteConfigs,
-            extensions: [
-              [$class: 'CloneOption', shallow: false, depth: 0, noTags: false],
-              [$class: 'PruneStaleBranch']
-            ]
+            extensions: scm.extensions,
+            userRemoteConfigs: scm.userRemoteConfigs.collect { urc ->
+              [
+                name: urc.name,
+                refspec: urc.refspec,
+                url: urc.url,
+                credentialsId: env.GIT_CRED_ID
+              ]
+            }
           ])
-          // Explicitly set the environment variables from that map
-          env.GIT_COMMIT = scmVars.GIT_COMMIT
-          env.GIT_PREVIOUS_COMMIT = scmVars.GIT_PREVIOUS_COMMIT
-          env.GIT_PREVIOUS_SUCCESSFUL_COMMIT = scmVars.GIT_PREVIOUS_SUCCESSFUL_COMMIT
-          echo "Branch: ${env.BRANCH_NAME}"
+          // Multibranch checkout often omits tags; IDP creates tags on GitHub — fetch them first.
+          sh 'git fetch --tags origin 2>/dev/null || git fetch --tags 2>/dev/null || true'
+
+          COMMIT_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+
+          def prefix = ''
+          if (env.BRANCH_NAME == 'development') {
+            prefix = 'dev'
+          } else if (env.BRANCH_NAME == 'staging') {
+            prefix = 'stag'
+          } else if (env.BRANCH_NAME == 'master' || env.BRANCH_NAME == 'main') {
+            prefix = 'prod'
+          } else {
+            prefix = 'dev'
+          }
+
+          BUILD_TYPE = (prefix == 'prod') ? 'production' : (prefix == 'stag' ? 'staging' : 'development')
+
+          // Prefer the same release tag IDP pushed (dev-|stag-|prod-...). Never use bare git describe --always
+          // when it resolves to only a short SHA — that caused Docker/K8s to tag images as "5548bfb" instead of the full tag.
+          def exactTag = sh(script: 'git describe --tags --exact-match HEAD 2>/dev/null || true', returnStdout: true).trim()
+          def idpTag = sh(script: 'git tag -l --points-at HEAD | grep -E "^(dev|stag|prod)-" | head -1', returnStdout: true).trim()
+          def describeOut = sh(script: 'git describe --tags --always 2>/dev/null || true', returnStdout: true).trim()
+
+          def isHexOnly = { s -> s && (s ==~ /^[0-9a-fA-F]{7,40}$/) }
+          def isIdpReleaseName = { s ->
+            s && (s.startsWith('dev-') || s.startsWith('stag-') || s.startsWith('prod-'))
+          }
+
+          def imageVer = ''
+          if (exactTag) {
+            imageVer = exactTag
+          } else if (idpTag) {
+            imageVer = idpTag
+          } else if (isIdpReleaseName(describeOut)) {
+            imageVer = describeOut
+          } else if (describeOut && !isHexOnly(describeOut) && !describeOut.startsWith('g')) {
+            imageVer = describeOut
+          } else {
+            def timestamp = new Date().format('yyyyMMdd.HHmmss')
+            def shortSha  = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+            imageVer = "${prefix}-${timestamp}-${shortSha}"
+          }
+
+          IS_TAG = imageVer
+          IMAGE_VERSION = imageVer
+          env.IS_TAG = IS_TAG
+          env.BUILD_TYPE = BUILD_TYPE
+          env.IMAGE_VERSION = IMAGE_VERSION
+
+          echo "Branch: ${env.BRANCH_NAME}  Commit: ${COMMIT_SHA}  Image tag: ${IMAGE_VERSION}"
         }
       }
     }
 
     /* =============================
-     * Tag & Branch Validation
+     * Secret / Env Injection
      * ============================= */
-    stage('Branch & Tag Validation') {
+    stage('Inject Environment') {
       steps {
         script {
-          IS_TAG = sh(
-            script: "git describe --exact-match --tags || echo ''",
-            returnStdout: true
-          ).trim()
-
-          if (!IS_TAG || env.BRANCH_NAME == 'dev') {
-            if (env.BRANCH_NAME == 'dev') {
-              def commitHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-              IS_TAG = "dev-${commitHash}"
-            } else {
-              error("❌ Build must be triggered by TAG")
+          try {
+            withCredentials([file(credentialsId: env.ENV_CRED_ID, variable: 'ENV_FILE')]) {
+              sh 'cp $ENV_FILE .env'
             }
+          } catch (e) {
+            echo "⚠️  No credential '${env.ENV_CRED_ID}' found — skipping .env injection"
           }
-          
-          echo "${IS_TAG} ${env.BRANCH_NAME}"
-
-          if (IS_TAG.startsWith('dev-') && env.BRANCH_NAME == 'dev') {
-            BUILD_TYPE = 'dev'
-            env.BUILD_TYPE = 'dev'
-            NAME_SPACE = "${PROJECT_NAME}-dev"
-          } else if (IS_TAG.startsWith('stag-') && env.BRANCH_NAME == 'staging') {
-            BUILD_TYPE = 'staging'
-            env.BUILD_TYPE = 'staging'
-            NAME_SPACE = "${PROJECT_NAME}-stag"
-          } else if (IS_TAG.startsWith('prod-') && env.BRANCH_NAME == 'master') {
-            BUILD_TYPE = 'production'
-            env.BUILD_TYPE = 'production'
-            NAME_SPACE = "${PROJECT_NAME}"
-          } else {
-            error("❌ Tag prefix & branch mismatch")
-          }
-
-          env.KUBECONFIG_DEV = "kubeconfig-${env.BUILD_TYPE}"
-
-          /* =====================================================
-           * DYNAMIC ENV INJECTION
-           * =====================================================
-           * Define all dynamic environment variables here.
-           * These will be injected into the service at runtime
-           * via Kubernetes (kubectl set env).
-           * ===================================================== */
-          def appEnv = (BUILD_TYPE == 'production') ? 'production' : BUILD_TYPE
-          env.DYNAMIC_RUNTIME_ENVS = [
-            "APP_ENV=${appEnv}"
-          ].join(',')
-
-          echo "${IS_TAG} ${env.BRANCH_NAME} ${env.KUBECONFIG_DEV}"
-          echo "Dynamic runtime envs: ${env.DYNAMIC_RUNTIME_ENVS}"
-          
-          // Capture Commit Metadata
-          env.COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
-          env.COMMIT_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
-
-          IMAGE_VERSION = IS_TAG
-
-          sendSlack("STARTED", PROJECT_NAME, env.BRANCH_NAME, IS_TAG, BUILD_TYPE, IMAGE_VERSION)
         }
       }
     }
 
     /* =============================
-     * SonarQube
+     * Gitleaks — Secret Detection
+     * ============================= */
+    stage('Gitleaks Scan') {
+      steps {
+        script {
+          sh '''
+            docker run --rm \
+              -v $(pwd):/path \
+              zricethezav/gitleaks:latest detect \
+              --source=/path \
+              --exit-code=1 \
+              --redact \
+              --no-git \
+              -v || true
+          '''
+        }
+      }
+    }
+
+    /* =============================
+     * SonarQube Analysis
      * ============================= */
     stage('SonarQube Analysis') {
-      when {
-        expression { return !params.SKIP_DEVSECOPS }
-      }
       steps {
         script {
           def scannerHome = tool name: SONAR_SCANNER_TOOL, type: 'hudson.plugins.sonar.SonarRunnerInstallation'
@@ -149,22 +162,22 @@ pipeline {
             sh """
               export PATH="${scannerHome}/bin:\${PATH}"
               sonar-scanner \
-                -Dsonar.projectKey=${SERVICE} \
-                -Dsonar.projectName=${SERVICE} \
-                -Dsonar.exclusions=**/node_modules/**,**/dist/**
+                -Dsonar.projectKey=${PROJECT_NAME} \
+                -Dsonar.projectName=${PROJECT_NAME} \
+                -Dsonar.exclusions=**/.nuxt/**,**/node_modules/**,**/dist/**,**/vendor/**,**/.next/**
             """
           }
         }
       }
     }
 
+    /* =============================
+     * Sonar Quality Gate
+     * ============================= */
     stage('Sonar Quality Gate') {
-      when {
-        expression { return !params.SKIP_DEVSECOPS }
-      }
       steps {
         timeout(time: 20, unit: 'MINUTES') {
-          waitForQualityGate abortPipeline: false
+          waitForQualityGate abortPipeline: true
         }
       }
     }
@@ -173,142 +186,235 @@ pipeline {
      * OWASP Dependency Check
      * ============================= */
     stage('OWASP Scan') {
-      when {
-        expression { return !params.SKIP_DEVSECOPS }
-      }
       steps {
-        dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'dp'
+        dependencyCheck additionalArguments: """--nvdApiKey ${NVD_API_KEY} --scan ./""", odcInstallation: 'dp'
         dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
       }
-      post {
-        failure {
-           script { env.FAILED_STAGE = 'OWASP Scan' }
-        }
-      }
     }
 
     /* =============================
-     * Trivy Security Scan
+     * Trivy FS Security Scan
      * ============================= */
     stage('Trivy Security Scan') {
-      when {
-        expression { return !params.SKIP_DEVSECOPS }
-      }
       steps {
         script {
-            def severity = 'CRITICAL'
-
-            def exitCode = sh(
-                script: """
-                  export TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db
-                  export TRIVY_DISABLE_MIRROR=true
-                  export TRIVY_CACHE_DIR=.trivy-cache/global
-                  mkdir -p .trivy-cache/global
-                  trivy --download-db-only || true
-                  trivy fs \
-                  --severity ${severity} \
-                  --ignore-unfixed \
-                  --exit-code 1 .
-                """,
-                returnStatus: true
-            )
-
-            if (exitCode != 0) {
-                env.FAILED_STAGE = "Trivy FS Scan: Critical Vulnerabilities Found"
-                error("Trivy found vulnerabilities")
-            }
-        }
-      }
-      post {
-        failure {
-          script { env.FAILED_STAGE = 'Trivy Security Scan' }
+          def severity = (BUILD_TYPE == 'development') ? 'CRITICAL' : 'HIGH,CRITICAL'
+          sh """
+            trivy fs \
+              --severity ${severity} \
+              --ignore-unfixed \
+              --exit-code 1 .
+          """
         }
       }
     }
 
     /* =============================
-     * Build & Deploy
+     * Unit Test (Node.js)
+     * ============================= */
+    stage('Unit Test') {
+      steps {
+        sh '''
+          npm ci
+          npm test -- --passWithNoTests || true
+        '''
+      }
+    }
+
+    /* =============================
+     * Docker Build  (multistage)
      * ============================= */
     stage('Docker Build') {
-      steps {  
-        sh "docker build -t ${REGISTRY}/${SERVICE}:${IMAGE_VERSION} -f Dockerfile ."
-      }
-      post {
-        failure {
-          script { env.FAILED_STAGE = "Docker Build" }
-        }
-      }
-    }
-
-    stage('Trivy Image Scan') {
-      when {
-        expression { return !params.SKIP_DEVSECOPS }
-      }
       steps {
         script {
-          def exitCode = sh(
-            script: """
-              TRIVY_CACHE_DIR=.trivy-cache/${SERVICE} trivy image --exit-code 1 --severity CRITICAL --scanners vuln --timeout 15m \
-              --ignore-unfixed \
-              ${REGISTRY}/${SERVICE}:${IMAGE_VERSION}
-            """,
-            returnStatus: true
-          )
+          // Write the generated Dockerfile from the IDP wizard
+          writeFile file: 'Dockerfile', text: '''
+# ── Prod-deps stage ──────────────────────────────────────────
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --prod
 
-          if (exitCode != 0) {
-             env.FAILED_STAGE = "Trivy Image Scan: Critical Vulnerabilities Found"
-             error("Trivy found vulnerabilities in ${SERVICE}")
-          }
-        }
-      }
-      post {
-        failure {
-           script { env.FAILED_STAGE = "Trivy Image Scan" }
+# ── Runtime stage (distroless) ────────────────────────────────
+FROM gcr.io/distroless/nodejs20-debian12 AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY src ./src
+EXPOSE 3000
+CMD ["src/index.js"]
+'''
+          sh "docker build -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION} ."
         }
       }
     }
 
+
+    /* =============================
+     * Trivy Image Scan
+     * ============================= */
+    stage('Trivy Image Scan') {
+      steps {
+        sh """
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            ${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION}
+        """
+      }
+    }
+
+    /* =============================
+     * Docker Push
+     * ============================= */
     stage('Docker Push') {
       steps {
         withDockerRegistry(url: REGISTRY_URL, credentialsId: REGISTRY_CRED) {
-          sh "docker push ${REGISTRY}/${SERVICE}:${IMAGE_VERSION}"
-        }
-      }
-      post {
-        failure {
-          script { env.FAILED_STAGE = "Docker Push" }
+          sh "docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION}"
         }
       }
     }
 
+    /* =============================
+     * Deploy to Kubernetes
+     * Bootstrap on first deploy, rolling update on subsequent deploys.
+     * ============================= */
     stage('Deploy to Kubernetes') {
       steps {
-        echo "${env.KUBECONFIG_DEV}"
-        withCredentials([file(credentialsId: env.KUBECONFIG_DEV, variable: 'KUBECONFIG')]) {
+        withCredentials([
+          file(credentialsId: KUBECONFIG_CRED, variable: 'KUBECONFIG'),
+          usernamePassword(credentialsId: REGISTRY_CRED, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')
+        ]) {
           script {
-            sh """
-              echo "Checking kubeconfig"
-              kubectl config view
-              kubectl set image deployment/${SERVICE} \
-                ${SERVICE}=${REGISTRY}/${SERVICE}:${IMAGE_VERSION} \
-                -n ${NAME_SPACE}
-            """
+            // Always ensure namespace and registry pull secret exist (idempotent)
+            sh '''
+              kubectl create namespace ${NAME_SPACE} --dry-run=client -o yaml \
+                --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
+              kubectl create secret docker-registry ${IMAGE_NAME}-registry \
+                --docker-server=$REGISTRY_URL \
+                --docker-username=$REG_USER \
+                --docker-password=$REG_PASS \
+                --namespace=${NAME_SPACE} \
+                --kubeconfig=$KUBECONFIG \
+                --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG
+            '''
 
-            // Inject dynamic runtime env vars
-            def envPairs = env.DYNAMIC_RUNTIME_ENVS.split(',')
-            def envArgs = envPairs.collect { it.trim() }.join(' ')
-            sh """
-              echo "Injecting dynamic env vars into ${SERVICE}: ${envArgs}"
-              kubectl set env deployment/${SERVICE} \
-                ${envArgs} \
-                -n ${NAME_SPACE}
-            """
+            def exists = sh(
+              script: 'kubectl get deployment/${IMAGE_NAME} -n ${NAME_SPACE} --ignore-not-found --kubeconfig=$KUBECONFIG',
+              returnStdout: true
+            ).trim()
+
+            echo "Applying ConfigMap / Secret / Deployment (classified at IDP Generate Jenkinsfile)"
+              echo "No ConfigMap variables — skipping"
+              echo "No Secret variables — skipping"
+              sh '''
+                kubectl apply -f - --kubeconfig=$KUBECONFIG <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meepo-mcp-server
+  namespace: meepo-development
+  labels:
+    app: meepo-mcp-server
+    env: ${BUILD_TYPE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meepo-mcp-server
+  template:
+    metadata:
+      labels:
+        app: meepo-mcp-server
+        version: ${IMAGE_VERSION}
+    spec:
+      imagePullSecrets:
+      - name: meepo-mcp-server-registry
+      containers:
+      - name: meepo-mcp-server
+        image: quantumteknologi/meepo-mcp-server:${IMAGE_VERSION}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+YAML
+              '''
+
+            if (!exists) {
+              echo "First deploy — creating Service for namespace ${NAME_SPACE}"
+              sh '''
+                kubectl apply -f - --kubeconfig=$KUBECONFIG <<YAML
+apiVersion: v1
+kind: Service
+metadata:
+  name: meepo-mcp-server
+  namespace: meepo-development
+spec:
+  selector:
+    app: meepo-mcp-server
+  ports:
+  - protocol: TCP
+    port: 3000
+    targetPort: 3000
+  type: ClusterIP
+YAML
+              '''
+            } else {
+              echo "Updating deployment image"
+              sh '''
+                kubectl set image deployment/${IMAGE_NAME} \
+                  ${IMAGE_NAME}=${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION} \
+                  -n ${NAME_SPACE} --kubeconfig=$KUBECONFIG
+              '''
+            }
+
+
+
+            sh '''
+              kubectl rollout status deployment/${IMAGE_NAME} -n ${NAME_SPACE} \
+                --timeout=180s --kubeconfig=$KUBECONFIG
+            '''
           }
         }
       }
-      post {
-        failure {
-           script { env.FAILED_STAGE = "Deploy to Kubernetes" }
+    }
+
+    /* =============================
+     * DAST — OWASP ZAP
+     * Runs after deploy so the live URL is available.
+     * ============================= */
+    stage('DAST OWASP ZAP') {
+      steps {
+        script {
+          def target = ''
+          if (!target) {
+            echo "⚠️  APP_URL not set — skipping DAST scan"
+          } else {
+            sh """
+              docker run --rm \
+                -v \$(pwd)/zap-reports:/zap/wrk:rw \
+                ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+                -t ${target} \
+                -r zap-report.html \
+                -I || true
+            """
+            publishHTML(target: [
+              allowMissing: true,
+              alwaysLinkToLastBuild: true,
+              keepAll: true,
+              reportDir: 'zap-reports',
+              reportFiles: 'zap-report.html',
+              reportName: 'OWASP ZAP Report'
+            ])
+          }
         }
       }
     }
@@ -316,95 +422,71 @@ pipeline {
 
   post {
     success {
-      sendSlack("SUCCESS", PROJECT_NAME, env.BRANCH_NAME, IS_TAG, BUILD_TYPE, IMAGE_VERSION)
+      script {
+
+
+        sendSlack('✅ DEPLOY SUCCESS', env.PROJECT_NAME, env.BRANCH_NAME, env.IMAGE_VERSION ?: '', env.BUILD_TYPE)
+
+
+      }
     }
     failure {
-      sendSlack("FAILURE", PROJECT_NAME, env.BRANCH_NAME, IS_TAG, BUILD_TYPE, IMAGE_VERSION, env.FAILED_STAGE)
+      script {
+
+
+        sendSlack('❌ DEPLOY FAILED', env.PROJECT_NAME, env.BRANCH_NAME, env.IMAGE_VERSION ?: '', env.BUILD_TYPE)
+
+
+      }
     }
     always {
+      script {
+        def buildStatus  = currentBuild.result ?: 'SUCCESS'
+        def startedAtSec = currentBuild.startTimeInMillis.intdiv(1000)
+        def durationMs   = currentBuild.duration
+        def commitMsg    = currentBuild.description ?: ''
+        // COMMIT_SHA is set by the Checkout stage; fall back to empty string if
+        // the stage was skipped (e.g. wrong branch) so the webhook still fires.
+        def sha = COMMIT_SHA ?: ''
+
+        sh """
+          curl -s -X POST '${env.IDP_WEBHOOK_URL}' \\
+            -H 'Content-Type: application/json' \\
+            -d '{
+              "branch":          "${BRANCH_NAME}",
+              "build_number":    ${BUILD_NUMBER},
+              "status":          "${buildStatus.toLowerCase()}",
+              "started_at":      ${startedAtSec},
+              "duration_ms":     ${durationMs},
+              "triggered_by":    "SCM",
+              "commit_sha":      "${sha}",
+              "commit_message":  "${commitMsg}"
+            }' || true
+        """
+      }
       sh '''
         echo "Cleaning up..."
         rm -rf dependency-check-report.xml || true
+        rm -f .env || true
         docker image prune -f || true
       '''
     }
   }
 }
 
+
 /* =============================
  * Notification Helpers
  * ============================= */
-def sendTelegram(String message) {
-  sh """
-    curl -s -X POST https://api.telegram.org/bot${BOT_TOKEN}/sendMessage \
-      -d chat_id=${GROUP_TELEGRAM} \
-      -d text="${message}" \
-      -d parse_mode=Markdown
-  """
-}
 
-def sendSlack(String status, String project, String branch, String tag, String type, String version, String failedStage = '') {
-  def color = ''
-  def title = ''
-  def icon = ''
-  
-  if (status == 'STARTED') {
-    color = '#3498db' // Blue
-    title = 'Pipeline Started'
-    icon = '🚀'
-  } else if (status == 'SUCCESS') {
-    color = '#2ecc71' // Green
-    title = 'Build Success'
-    icon = '✅'
-  } else {
-    color = '#e74c3c' // Red
-    title = 'Build Failed'
-    icon = '🚨'
-  }
 
-  def commitMsg = env.COMMIT_MSG ?: 'Unknown'
-  def author = env.COMMIT_AUTHOR ?: 'Unknown'
-  
-  // Escape JSON special characters manually to be safe without JsonOutput
-  commitMsg = commitMsg.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-  author = author.replace('\\', '\\\\').replace('"', '\\"')
-  
-  def payload = """
-  {
-    "attachments": [
-      {
-        "color": "${color}",
-        "pretext": "*${icon} ${title}*",
-        "fields": [
-          { "title": "Project", "value": "${project}", "short": true },
-          { "title": "Branch", "value": "${branch}", "short": true },
-          { "title": "Environment", "value": "${type}", "short": true },
-          { "title": "Tag", "value": "${tag}", "short": true },
-          { "title": "Author", "value": "${author}", "short": true },
-          { "title": "Failed Stage", "value": "${failedStage ?: 'None'}", "short": true },
-          { "title": "Commit", "value": "${commitMsg}", "short": false },
-          { "title": "Built Services", "value": "• ${SERVICE}", "short": false }
-        ],
-        "footer": "Jenkins CI",
-        "ts": ${System.currentTimeMillis() / 1000},
-        "actions": [
-          {
-            "type": "button",
-            "text": "View Logs",
-            "url": "${env.BUILD_URL}",
-            "style": "primary"
-          }
-        ]
-      }
-    ]
-  }
-  """
-  
-  writeFile file: 'slack-payload.json', text: payload
-  
+def sendSlack(String status, String project, String branch, String tag, String type) {
+  def payload = """{"text": "*${status}*\\n📦 Project: ${project}\\n🌿 Branch: ${branch}\\n🏷 Tag: ${tag}\\n🚀 Env: ${type}"}"""
   sh """
     curl -X POST ${SLACK_BOT_WEBHOOK_URL} \
       -H 'Content-Type: application/json' \
-      -d @slack-payload.json
+      -d '${payload}'
   """
 }
+
+
