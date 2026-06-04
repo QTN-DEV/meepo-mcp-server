@@ -1,6 +1,7 @@
 import { config } from './config.js'
 import { loadToken, saveToken, clearToken } from './token-store.js'
 import { openBrowserAndWaitForToken } from './browser-auth.js'
+import { getContextToken } from './token-context.js'
 
 let cachedToken: string | null = null
 let cachedUser: any = null
@@ -9,6 +10,7 @@ let cachedUser: any = null
  * Returns a valid access token.
  *
  * Resolution order:
+ * 0. Transport-provided Bearer token (from OAuth — used in HTTP deployments)
  * 1. In-memory cache (fastest)
  * 2. Saved credentials from ~/.meepo/credentials.json
  * 3. Env vars MEEPO_EMAIL / MEEPO_PASSWORD (CI / server deployments)
@@ -18,6 +20,39 @@ export async function login(email?: string, password?: string): Promise<{ token:
     // If explicit credentials provided, always re-authenticate
     if (email && password) {
         return await loginWithCredentials(email, password)
+    }
+
+    // 0. Transport-provided Bearer token (OAuth flow — each user gets their own)
+    const contextToken = getContextToken()
+    if (contextToken) {
+        // Use per-token cache to avoid repeated /me calls for the same token
+        if (cachedToken === contextToken && cachedUser) {
+            return { token: contextToken, user: cachedUser }
+        }
+        // Fetch full user profile from auth service (JWT alone doesn't have companyId)
+        try {
+            const meRes = await fetch(`${config.authServiceUrl}/api/v1/auth/user/me`, {
+                headers: { Cookie: `userAccessToken=${contextToken}` }
+            })
+            if (meRes.ok) {
+                const meData = await meRes.json() as any
+                const user = meData.data?.user
+                if (user) {
+                    cachedToken = contextToken
+                    cachedUser = user
+                    return { token: contextToken, user }
+                }
+            }
+        } catch (err: any) {
+            console.error('[meepo-mcp] Failed to fetch user profile from OAuth token:', err.message)
+        }
+        // Fallback: return token with minimal user info from JWT
+        try {
+            const payload = JSON.parse(Buffer.from(contextToken.split('.')[1], 'base64url').toString())
+            return { token: contextToken, user: { id: payload.userId } }
+        } catch {
+            return { token: contextToken, user: {} }
+        }
     }
 
     // 1. In-memory cache

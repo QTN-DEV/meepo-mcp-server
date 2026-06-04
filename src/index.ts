@@ -20,6 +20,7 @@ import { registerSubscriptionTools } from './tools/subscription.js'
 import { registerFileTools } from './tools/files.js'
 import cors from 'cors'
 import { config } from './config.js'
+import { runWithToken } from './token-context.js'
 
 // ── Helpers ──────────────────────────────────────────────────
 function getPublicUrl(req?: express.Request): string {
@@ -357,93 +358,102 @@ if (process.env.TRANSPORT === 'sse' || true) { // Kept user's local override for
             res.status(401).json({ error: 'Unauthorized', message: 'Missing or invalid Bearer token.' })
             return
         }
+        ;(req as any).bearerToken = authHeader.slice(7)
         next()
     }
 
-    // ── Streamable HTTP Transport (/mcp) ──────────────────────
-    app.all('/mcp', authenticate, async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined
+    function getBearerToken(req: express.Request): string {
+        return (req as any).bearerToken || ''
+    }
 
-        // DELETE — terminate session
-        if (req.method === 'DELETE') {
+    app.all('/mcp', authenticate, async (req, res) => {
+        await runWithToken(getBearerToken(req), async () => {
+            const sessionId = req.headers['mcp-session-id'] as string | undefined
+
+            // DELETE — terminate session
+            if (req.method === 'DELETE') {
+                if (sessionId && httpSessions.has(sessionId)) {
+                    const session = httpSessions.get(sessionId)!
+                    await session.transport.close()
+                    httpSessions.delete(sessionId)
+                    res.status(200).end()
+                } else {
+                    res.status(404).send('Session not found')
+                }
+                return
+            }
+
+            // Existing session — route to its transport
             if (sessionId && httpSessions.has(sessionId)) {
                 const session = httpSessions.get(sessionId)!
-                await session.transport.close()
-                httpSessions.delete(sessionId)
-                res.status(200).end()
-            } else {
+                await session.transport.handleRequest(req, res, req.body)
+                return
+            }
+
+            // No session or unknown session — only allow initialize
+            if (sessionId && !httpSessions.has(sessionId)) {
                 res.status(404).send('Session not found')
+                return
             }
-            return
-        }
 
-        // Existing session — route to its transport
-        if (sessionId && httpSessions.has(sessionId)) {
-            const session = httpSessions.get(sessionId)!
-            await session.transport.handleRequest(req, res, req.body)
-            return
-        }
+            // New session — create transport + server
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => crypto.randomUUID(),
+            })
+            const server = createMcpServer()
+            await server.connect(transport)
+            await transport.handleRequest(req, res, req.body)
 
-        // No session or unknown session — only allow initialize
-        if (sessionId && !httpSessions.has(sessionId)) {
-            res.status(404).send('Session not found')
-            return
-        }
-
-        // New session — create transport + server
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto.randomUUID(),
+            if (transport.sessionId) {
+                httpSessions.set(transport.sessionId, { server, transport })
+                transport.onclose = () => {
+                    httpSessions.delete(transport.sessionId!)
+                }
+            }
         })
-        const server = createMcpServer()
-        await server.connect(transport)
-        await transport.handleRequest(req, res, req.body)
-
-        if (transport.sessionId) {
-            httpSessions.set(transport.sessionId, { server, transport })
-            transport.onclose = () => {
-                httpSessions.delete(transport.sessionId!)
-            }
-        }
     })
 
-    // ── Legacy SSE Transport (/sse + /messages) ──────────────
     app.get('/sse', authenticate, async (req, res) => {
-        // Keep the SSE connection alive
-        req.socket.setTimeout(0);
-        res.socket?.setTimeout(0);
+        await runWithToken(getBearerToken(req), async () => {
+            // Keep the SSE connection alive
+            req.socket.setTimeout(0);
+            res.socket?.setTimeout(0);
 
-        const transport = new SSEServerTransport('/messages', res)
-        const server = createMcpServer()
-        await server.connect(transport)
+            const transport = new SSEServerTransport('/messages', res)
+            const server = createMcpServer()
+            await server.connect(transport)
 
-        if (transport.sessionId) {
-            transports.set(transport.sessionId, transport)
-            res.on('close', () => {
-                transports.delete(transport.sessionId)
-                try {
-                    transport.close()
-                } catch (e) {
-                    // Ignore close errors
-                }
-            })
-        }
+            if (transport.sessionId) {
+                transports.set(transport.sessionId, transport)
+                res.on('close', () => {
+                    transports.delete(transport.sessionId)
+                    try {
+                        transport.close()
+                    } catch (e) {
+                        // Ignore close errors
+                    }
+                })
+            }
+        })
     })
 
     app.post('/messages', authenticate, async (req, res) => {
-        const sessionId = req.query.sessionId as string
-        console.log(`[POST /messages] Request received for sessionId: ${sessionId}`)
+        await runWithToken(getBearerToken(req), async () => {
+            const sessionId = req.query.sessionId as string
+            console.log(`[POST /messages] Request received for sessionId: ${sessionId}`)
 
-        const transport = transports.get(sessionId)
-        if (!transport) {
-            console.log(`[POST /messages] Session not found for sessionId: ${sessionId}`)
-            res.status(404).send('Session not found or SSE transport not initialized.')
-            return
-        }
-        try {
-            await transport.handlePostMessage(req, res)
-        } catch (error) {
-            console.error(`[POST /messages] Error handling post message:`, error)
-        }
+            const transport = transports.get(sessionId)
+            if (!transport) {
+                console.log(`[POST /messages] Session not found for sessionId: ${sessionId}`)
+                res.status(404).send('Session not found or SSE transport not initialized.')
+                return
+            }
+            try {
+                await transport.handlePostMessage(req, res)
+            } catch (error) {
+                console.error(`[POST /messages] Error handling post message:`, error)
+            }
+        })
     })
 
     const PORT = Number(process.env.PORT ?? 8008)
